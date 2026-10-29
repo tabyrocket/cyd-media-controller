@@ -1,9 +1,9 @@
 <div align="center">
 
-# 🎵 CYD Media Display
+# ESP32 CYD Media Controller
 
 **A free, no-API "now playing" screen and touch remote for any Windows media app.**
-Album art, live progress, album-colour backgrounds, and three touch buttons, all on a ~$15 ESP32 touchscreen.
+Album art, live progress, album-colour backgrounds, and three touch buttons, on a ~$15 ESP32 touchscreen.
 
 ![ESP32](https://img.shields.io/badge/ESP32-CYD%202432S028-e7352c?logo=espressif&logoColor=white)
 ![.NET](https://img.shields.io/badge/.NET-10-512bd4?logo=dotnet&logoColor=white)
@@ -47,13 +47,24 @@ Album art, live progress, album-colour backgrounds, and three touch buttons, all
   </tr>
 </table>
 
-| Idle | WiFi Lost | Board Image |
-|:---:|:---:|:---:|
-| <img src="docs/images/idle.jpg" width="190"> | <img src="docs/images/wifi-lost.jpg" width="190"> | <img src="docs/images/board.png" width="190"> |
-| "Nothing playing" | Retries every 10 s | ESP32-2432S028 |
+<table>
+  <tr>
+    <th colspan="3">Device States</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/images/idle.jpg" width="260"></td>
+    <td align="center"><img src="docs/images/wifi-lost.jpg" width="260"></td>
+    <td align="center"><img src="docs/images/board.png" width="260"></td>
+  </tr>
+  <tr>
+    <td align="center">Nothing playing</td>
+    <td align="center">Retries every 10 s</td>
+    <td align="center">ESP32-2432S028</td>
+  </tr>
+</table>
 
 
-## 🧠 How it works
+## System Architecture
 
 ```mermaid
 flowchart LR
