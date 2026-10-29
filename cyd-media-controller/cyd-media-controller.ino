@@ -7,6 +7,7 @@
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
 #include "config.h"
+#include "esp_heap_caps.h"
 
 // ---------- hardware ----------
 #define T_IRQ  36
@@ -23,7 +24,7 @@
 
 // ---------- tunables ----------
 #define BL_PIN          21
-#define BL_FULL         255
+#define BL_FULL         204
 #define BL_DIM          25        // 0-255, lower = darker
 #define DIM_AFTER_MS    30000     // not playing for this long -> dim
 #define SCROLL_STEP_MS  40        // time between scroll steps
@@ -31,6 +32,9 @@
 #define SCROLL_HOLD_MS  1500      // pause at the start of each scroll
 #define SCROLL_GAP      40        // gap between end and repeat of the title
 #define NOART_GRACE_MS  2500      // wait this long for art before using the default background
+#define WIFI_RETRY_MS      10000    // retry Wi-Fi this often while it is down
+#define WIFI_RESTART_MS    300000   // restart the board if Wi-Fi stays down this long (5 min)
+#define HEAP_RESTART_BELOW 60000    // restart if free heap stays below this (bytes)
 
 // ---------- layout ----------
 #define ART_X    8
@@ -74,12 +78,13 @@ WebSocketsClient ws;
 
 // ---------- state ----------
 bool wsUp = false;
+bool wifiUp = true;
 String title, artist, album, stateStr;
 bool isPlaying = false;
 long posMs = 0, durMs = 0;
 uint32_t posAt = 0;
 
-enum Mode { M_NONE, M_OFFLINE, M_IDLE, M_PLAY };
+enum Mode { M_NONE, M_NOWIFI, M_OFFLINE, M_IDLE, M_PLAY };
 Mode drawnMode = M_NONE;
 bool textDirty = true;
 bool forceRepaint = false;
@@ -349,9 +354,12 @@ void drawText(Mode m) {
     drawLine(TEXT_X, ALBUM_Y,  fitText(album,  TEXT_W, 2), 2, C_GREY);
   } else {
     titleScroll = false;
-    drawLine(TEXT_X, 14, m == M_IDLE ? "Nothing" : "Bridge", 4, TFT_WHITE);
-    drawLine(TEXT_X, 44, m == M_IDLE ? "playing" : "offline", 4, TFT_WHITE);
-    if (m == M_OFFLINE) drawLine(TEXT_X, 84, "Reconnecting...", 2, C_GREY);
+    const char *a = "Nothing", *b = "playing";
+    if (m == M_OFFLINE) { a = "Bridge"; b = "offline"; }
+    if (m == M_NOWIFI)  { a = "Wi-Fi";  b = "lost"; }
+    drawLine(TEXT_X, 14, a, 4, TFT_WHITE);
+    drawLine(TEXT_X, 44, b, 4, TFT_WHITE);
+    if (m == M_OFFLINE || m == M_NOWIFI) drawLine(TEXT_X, 84, "Reconnecting...", 2, C_GREY);
   }
 }
 
@@ -440,7 +448,7 @@ void updateArt() {
 
 // ================= render =================
 void render() {
-  Mode m = !wsUp ? M_OFFLINE : (title.length() == 0 ? M_IDLE : M_PLAY);
+  Mode m = !wifiUp ? M_NOWIFI : (!wsUp ? M_OFFLINE : (title.length() == 0 ? M_IDLE : M_PLAY));
   if (m != drawnMode || forceRepaint) {
     if (m != drawnMode && m != M_PLAY) {
       artValid = false; doneKey = "";
@@ -594,6 +602,61 @@ void setup() {
   lastActivity = millis();
 }
 
+// ------- Wi-Fi supervision and heap guard --------
+uint32_t wifiDownSince = 0, lastWifiRetry = 0;
+
+void serviceWifi() {
+  bool up = (WiFi.status() == WL_CONNECTED);
+  uint32_t now = millis();
+
+  if (up) {
+    if (!wifiUp) {
+      wifiUp = true;
+      lastActivity = now;                               // wake the screen
+      Serial.printf("[wifi] back. IP=%s RSSI=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }
+    return;
+  }
+
+  if (wifiUp) {                                         // it just dropped
+    wifiUp = false;
+    wifiDownSince = lastWifiRetry = now;
+    wsUp = false;
+    ws.disconnect();                                    // don't leave socket unclosed
+    Serial.println("[wifi] LOST");
+    return;
+  }
+
+  if (now - wifiDownSince > WIFI_RESTART_MS) {
+    Serial.println("[wifi] down too long, restarting");
+    delay(200);
+    ESP.restart();
+  }
+  if (now - lastWifiRetry >= WIFI_RETRY_MS) {
+    lastWifiRetry = now;
+    Serial.printf("[wifi] retrying (down %lus)\n", (unsigned long)((now - wifiDownSince) / 1000));
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+}
+
+void heapGuard() {
+  static uint32_t last = 0;
+  static int lowCount = 0;
+  if (millis() - last < 60000) return;
+  last = millis();
+  uint32_t freeH = ESP.getFreeHeap();
+  uint32_t big = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  Serial.printf("[heap] free=%u largest=%u min=%u uptime=%lum\n",
+                (unsigned)freeH, (unsigned)big, (unsigned)ESP.getMinFreeHeap(),
+                (unsigned long)(millis() / 60000));
+  if (freeH < HEAP_RESTART_BELOW) {
+    if (++lowCount >= 2) { Serial.println("[heap] critically low, restarting"); delay(200); ESP.restart(); }
+  } else {
+    lowCount = 0;
+  }
+}
+
 void loop() {
   ws.loop();
 
@@ -609,7 +672,7 @@ void loop() {
       if (sx >= btns[i].x && sx < btns[i].x + btns[i].w &&
           sy >= btns[i].y && sy < btns[i].y + btns[i].h) hit = i;
 
-    if (!wasTouched && hit >= 0 && millis() - lastPress > 250) {   // ...and the same touch still acts
+    if (!wasTouched && hit >= 0 && millis() - lastPress > 250) {  // touch still interacts
       lastPress = millis();
       sendCmd(btns[hit].cmd);
     }
@@ -621,9 +684,17 @@ void loop() {
     drawButtons();
   }
 
+  // Test hook: type 'w' in the Serial Monitor to simulate a Wi-Fi drop
+  if (Serial.available() && Serial.read() == 'w') {
+    Serial.println("[test] forcing Wi-Fi drop");
+    WiFi.disconnect();
+  }
+
+  serviceWifi();
   render();
   updateScroll();
   updateBacklight();
+  heapGuard();
 
   static uint32_t lastStat = 0;
   if (millis() - lastStat > 10000) {
