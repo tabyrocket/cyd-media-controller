@@ -1,4 +1,7 @@
-﻿using System.Text.Json;
+﻿using System.Collections.Concurrent;
+using System.Net.WebSockets;
+using System.Text.Json;
+using System.Threading.Channels;
 using Windows.Graphics.Imaging;
 using Windows.Media.Control;
 using Windows.Storage.Streams;
@@ -8,20 +11,18 @@ builder.WebHost.UseUrls("http://0.0.0.0:8080");
 builder.Services.ConfigureHttpJsonOptions(o =>
     o.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower);
 builder.Services.AddSingleton<MediaState>();
+builder.Services.AddSingleton<Hub>();
 builder.Services.AddHostedService<MediaPoller>();
 
 var app = builder.Build();
+app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(15) });
 
-app.MapGet("/", () => "MediaBridge is running. Try /now-playing and /artwork");
+app.MapGet("/", () => "MediaBridge is running. Try /now-playing, /artwork, and ws://<ip>:8080/media");
 
 app.MapGet("/now-playing", (HttpContext ctx, MediaState st) =>
 {
-    var s = st.Current;
-    int v = st.ArtVersion;
-    string? artUrl = v > 0 ? $"{ctx.Request.Scheme}://{ctx.Request.Host}/artwork?v={v}" : null;
     ctx.Response.Headers.CacheControl = "no-store";
-    return Results.Json(new NowPlaying(s.Title, s.Artist, s.Album, s.State,
-        s.PositionMs, s.DurationMs, artUrl, s.UpdatedAt, s.App));
+    return Results.Json(Json.Build(st, $"{ctx.Request.Scheme}://{ctx.Request.Host}"));
 });
 
 app.MapGet("/artwork", (HttpContext ctx, MediaState st) =>
@@ -31,10 +32,77 @@ app.MapGet("/artwork", (HttpContext ctx, MediaState st) =>
     return a == null ? Results.NotFound() : Results.File(a, "image/jpeg");
 });
 
+app.Map("/media", async (HttpContext ctx, MediaState st, Hub hub) =>
+{
+    if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = 400; return; }
+
+    using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+    var (id, ch) = hub.Register();
+    var ct = ctx.RequestAborted;
+    string baseUrl = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] WS client connected: {ctx.Connection.RemoteIpAddress} ({hub.Count} total)");
+
+    // Watches for the client closing or vanishing, and wakes the send loop when it does
+    var recv = Task.Run(async () =>
+    {
+        var buf = new byte[256];
+        try
+        {
+            while (ws.State == WebSocketState.Open)
+            {
+                var r = await ws.ReceiveAsync(buf, ct);
+                if (r.MessageType == WebSocketMessageType.Close) break;
+            }
+        }
+        catch { }
+        ch.Writer.TryWrite(0);
+    });
+
+    try
+    {
+        while (ws.State == WebSocketState.Open && !recv.IsCompleted && !ct.IsCancellationRequested)
+        {
+            var json = JsonSerializer.SerializeToUtf8Bytes(Json.Build(st, baseUrl), Json.Options);
+            await ws.SendAsync(json, WebSocketMessageType.Text, true, ct);
+
+            // Wait for a change signal, or send a heartbeat after 5 s
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
+            try { await ch.Reader.WaitToReadAsync(cts.Token); }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+            while (ch.Reader.TryRead(out _)) { }
+        }
+    }
+    catch (OperationCanceledException) { }
+    catch (WebSocketException) { }
+    finally
+    {
+        hub.Unregister(id);
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] WS client left ({hub.Count} total)");
+    }
+});
+
 Console.WriteLine("MediaBridge listening on port 8080");
 app.Run();
 
 // ---------- types ----------
+
+static class Json
+{
+    public static readonly JsonSerializerOptions Options = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
+    };
+
+    public static NowPlaying Build(MediaState st, string baseUrl)
+    {
+        var s = st.Current;
+        int v = st.ArtVersion;
+        string? artUrl = v > 0 ? $"{baseUrl}/artwork?v={v}" : null;
+        return new NowPlaying(s.Title, s.Artist, s.Album, s.State,
+            s.PositionMs, s.DurationMs, artUrl, s.UpdatedAt, s.App);
+    }
+}
 
 record NowPlaying(string Title, string Artist, string Album, string State,
                   long PositionMs, long DurationMs, string? ArtUrl, long UpdatedAt, string App);
@@ -60,13 +128,38 @@ class MediaState
     public void ClearArt() { art = null; }
 }
 
-class MediaPoller(MediaState state) : BackgroundService
+// Tracks connected WebSocket clients and wakes them when something changed
+class Hub
+{
+    readonly ConcurrentDictionary<Guid, Channel<byte>> clients = new();
+    public int Count => clients.Count;
+
+    public (Guid, Channel<byte>) Register()
+    {
+        var ch = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
+            { FullMode = BoundedChannelFullMode.DropOldest });
+        var id = Guid.NewGuid();
+        clients[id] = ch;
+        return (id, ch);
+    }
+
+    public void Unregister(Guid id) => clients.TryRemove(id, out _);
+
+    public void Notify()
+    {
+        foreach (var c in clients.Values) c.Writer.TryWrite(0);
+    }
+}
+
+class MediaPoller(MediaState state, Hub hub) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
         GlobalSystemMediaTransportControlsSessionManager? manager = null;
         string lastTrackKey = "";
         string lastLogKey = "";
+        string lastNotifyKey = "";
+        long lastNotifyPos = 0, lastNotifyTime = 0;
         int artTries = 0;
 
         while (!ct.IsCancellationRequested)
@@ -83,6 +176,7 @@ class MediaPoller(MediaState state) : BackgroundService
                     state.ClearArt();
                     lastTrackKey = "";
                     if (lastLogKey != "NONE") { Console.WriteLine("No active media session"); lastLogKey = "NONE"; }
+                    if (lastNotifyKey != "NONE") { lastNotifyKey = "NONE"; hub.Notify(); }
                 }
                 else
                 {
@@ -107,7 +201,6 @@ class MediaPoller(MediaState state) : BackgroundService
                     if (duration <= TimeSpan.Zero) duration = TimeSpan.Zero;
                     else if (position > duration) position = duration;
 
-                    // New track: forget the old artwork
                     string trackKey = $"{app}|{props.Title}|{props.Artist}|{props.AlbumTitle}";
                     if (trackKey != lastTrackKey)
                     {
@@ -116,7 +209,6 @@ class MediaPoller(MediaState state) : BackgroundService
                         state.ClearArt();
                     }
 
-                    // Thumbnail sometimes arrives a moment after the text, so retry a few times
                     if (!state.HasArt && props.Thumbnail != null && artTries < 5)
                     {
                         artTries++;
@@ -128,9 +220,22 @@ class MediaPoller(MediaState state) : BackgroundService
                         }
                     }
 
+                    long posMs = (long)position.TotalMilliseconds;
                     state.Current = new Snapshot(app, props.Title ?? "", props.Artist ?? "",
                         props.AlbumTitle ?? "", stateStr,
-                        (long)position.TotalMilliseconds, (long)duration.TotalMilliseconds, now);
+                        posMs, (long)duration.TotalMilliseconds, now);
+
+                    // Push changes to clients
+                    string notifyKey = $"{trackKey}|{stateStr}|{state.ArtVersion}|{(long)duration.TotalMilliseconds}";
+                    bool seek = stateStr == "playing" &&
+                                Math.Abs(posMs - (lastNotifyPos + (now - lastNotifyTime))) > 1500;
+                    if (notifyKey != lastNotifyKey || seek)
+                    {
+                        lastNotifyKey = notifyKey;
+                        lastNotifyPos = posMs;
+                        lastNotifyTime = now;
+                        hub.Notify();
+                    }
 
                     string logKey = $"{trackKey}|{stateStr}";
                     if (logKey != lastLogKey)
@@ -143,14 +248,13 @@ class MediaPoller(MediaState state) : BackgroundService
             catch (Exception ex)
             {
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ERROR: {ex.GetType().Name}: {ex.Message}");
-                manager = null;   // re-request the manager on the next loop
+                manager = null;
             }
 
-            try { await Task.Delay(1000, ct); } catch (OperationCanceledException) { }
+            try { await Task.Delay(500, ct); } catch (OperationCanceledException) { }
         }
     }
 
-    // Decode whatever Windows gives us, centre-crop to a square, scale to 160x160, write baseline JPEG
     static async Task<byte[]?> EncodeArtAsync(IRandomAccessStreamReference thumbnail)
     {
         try
