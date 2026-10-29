@@ -106,12 +106,14 @@ static class Json
         int v = st.ArtVersion;
         string? artUrl = v > 0 ? $"{baseUrl}/artwork?v={v}" : null;
         return new NowPlaying(s.Title, s.Artist, s.Album, s.State,
-            s.PositionMs, s.DurationMs, artUrl, s.UpdatedAt, s.App);
+            s.PositionMs, s.DurationMs, artUrl, s.UpdatedAt, s.App,
+            v > 0 ? st.ArtColors : null);
     }
 }
 
 record NowPlaying(string Title, string Artist, string Album, string State,
-                  long PositionMs, long DurationMs, string? ArtUrl, long UpdatedAt, string App);
+                  long PositionMs, long DurationMs, string? ArtUrl, long UpdatedAt, string App,
+                  int[]? ArtColors);
 
 record Snapshot(string App, string Title, string Artist, string Album, string State,
                 long PositionMs, long DurationMs, long UpdatedAt)
@@ -124,14 +126,16 @@ class MediaState
 {
     public volatile Snapshot Current = Snapshot.Empty;
     byte[]? art;
+    int[]? artColors;
     int artCounter;
 
     public byte[]? Art => art;
+    public int[]? ArtColors => artColors;
     public bool HasArt => art != null;
     public int ArtVersion => art == null ? 0 : artCounter;
 
-    public void SetArt(byte[] bytes) { artCounter++; art = bytes; }
-    public void ClearArt() { art = null; }
+    public void SetArt(byte[] bytes, int[] colors) { artCounter++; artColors = colors; art = bytes; }
+    public void ClearArt() { art = null; artColors = null; }
 }
 
 // Tracks connected WebSocket clients and wakes them when something changed
@@ -218,11 +222,11 @@ class MediaPoller(MediaState state, Hub hub) : BackgroundService
                     if (!state.HasArt && props.Thumbnail != null && artTries < 5)
                     {
                         artTries++;
-                        var jpg = await EncodeArtAsync(props.Thumbnail);
-                        if (jpg != null)
+                        var res = await EncodeArtAsync(props.Thumbnail);
+                        if (res != null)
                         {
-                            state.SetArt(jpg);
-                            Console.WriteLine($"   artwork encoded: {jpg.Length} bytes");
+                            state.SetArt(res.Value.Jpg, res.Value.Colors);
+                            Console.WriteLine($"   artwork encoded: {res.Value.Jpg.Length} bytes");
                         }
                     }
 
@@ -261,11 +265,35 @@ class MediaPoller(MediaState state, Hub hub) : BackgroundService
         }
     }
 
-    static async Task<byte[]?> EncodeArtAsync(IRandomAccessStreamReference thumbnail)
+        // Saturation-weighted average colour of the top half and bottom half of a BGRA image
+    static int[] HalfColors(byte[] px, int size)
+    {
+        var res = new int[6];
+        for (int half = 0; half < 2; half++)
+        {
+            double sr = 0, sg = 0, sb = 0, sw = 0;
+            int y0 = half * size / 2, y1 = (half + 1) * size / 2;
+            for (int y = y0; y < y1; y++)
+                for (int x = 0; x < size; x++)
+                {
+                    int i = (y * size + x) * 4;
+                    int b = px[i], g = px[i + 1], r = px[i + 2];
+                    int mx = Math.Max(r, Math.Max(g, b)), mn = Math.Min(r, Math.Min(g, b));
+                    double w = 0.05 + (mx - mn) / 255.0;   // vivid pixels count more than grey ones
+                    sr += r * w; sg += g * w; sb += b * w; sw += w;
+                }
+            res[half * 3]     = (int)(sr / sw);
+            res[half * 3 + 1] = (int)(sg / sw);
+            res[half * 3 + 2] = (int)(sb / sw);
+        }
+        return res;
+    }
+
+    static async Task<(byte[] Jpg, int[] Colors)?> EncodeArtAsync(IRandomAccessStreamReference thumbnail)
     {
         try
         {
-            const uint size = 160;
+            const uint size = 128;
             using var src = await thumbnail.OpenReadAsync();
             var decoder = await BitmapDecoder.CreateAsync(src);
             uint w = decoder.PixelWidth, h = decoder.PixelHeight;
@@ -287,10 +315,13 @@ class MediaPoller(MediaState state, Hub hub) : BackgroundService
                 BitmapPixelFormat.Bgra8, BitmapAlphaMode.Ignore, transform,
                 ExifOrientationMode.IgnoreExifOrientation, ColorManagementMode.DoNotColorManage);
 
+            byte[] px = pixels.DetachPixelData();
+            int[] colors = HalfColors(px, (int)size);
+
             using var mem = new InMemoryRandomAccessStream();
             var encoder = await BitmapEncoder.CreateAsync(BitmapEncoder.JpegEncoderId, mem);
             encoder.SetPixelData(BitmapPixelFormat.Bgra8, BitmapAlphaMode.Ignore,
-                size, size, 96, 96, pixels.DetachPixelData());
+                size, size, 96, 96, px);
             await encoder.FlushAsync();
 
             var bytes = new byte[mem.Size];
@@ -298,7 +329,7 @@ class MediaPoller(MediaState state, Hub hub) : BackgroundService
             using var reader = new DataReader(mem);
             await reader.LoadAsync((uint)mem.Size);
             reader.ReadBytes(bytes);
-            return bytes;
+            return (bytes, colors);
         }
         catch (Exception ex)
         {
