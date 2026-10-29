@@ -27,6 +27,7 @@
 #define BL_FULL         204
 #define BL_DIM          25        // 0-255, lower = darker
 #define DIM_AFTER_MS    30000     // not playing for this long -> dim
+#define SLEEP_AFTER_MS  300000   // total inactivity before the screen turns fully off (5 min)
 #define SCROLL_STEP_MS  40        // time between scroll steps
 #define SCROLL_PX       2         // pixels per step
 #define SCROLL_HOLD_MS  1500      // pause at the start of each scroll
@@ -121,6 +122,7 @@ uint32_t scrollNext = 0, scrollHold = 0;
 
 // ---------- backlight ----------
 int blNow = BL_FULL;
+bool screenOff = false;                // true once the sleep timeout has passed
 uint32_t lastActivity = 0;
 
 // ================= colour helpers =================
@@ -350,8 +352,8 @@ void drawText(Mode m) {
       drawLine(TEXT_X, TITLE_Y1, l1, 4, TFT_WHITE);
       drawLine(TEXT_X, TITLE_Y2, l2, 4, TFT_WHITE);
     }
-    drawLine(TEXT_X, ARTIST_Y, fitText(artist, TEXT_W, 2), 2, C_GREY);
-    drawLine(TEXT_X, ALBUM_Y,  fitText(album,  TEXT_W, 2), 2, C_GREY);
+    drawLine(TEXT_X, ARTIST_Y, fitText(artist, TEXT_W, 2), 2, TFT_WHITE);
+    drawLine(TEXT_X, ALBUM_Y,  fitText(album,  TEXT_W, 2), 2, TFT_WHITE);
   } else {
     titleScroll = false;
     const char *a = "Nothing", *b = "playing";
@@ -471,6 +473,7 @@ void render() {
 // ================= backlight =================
 void wakeBacklight() {
   lastActivity = millis();
+  screenOff = false;
   if (blNow < BL_FULL) { blNow = BL_FULL; ledcWrite(0, blNow); }   // instant, no fade
 }
 
@@ -480,7 +483,9 @@ void updateBacklight() {
   if (now - lastStep < 15) return;
   lastStep = now;
   if (wsUp && isPlaying) lastActivity = now;          // playing keeps the screen bright
-  int target = (now - lastActivity > DIM_AFTER_MS) ? BL_DIM : BL_FULL;
+  uint32_t idle = now - lastActivity;
+  screenOff = (idle > SLEEP_AFTER_MS);
+  int target = screenOff ? 0 : (idle > DIM_AFTER_MS ? BL_DIM : BL_FULL);
   int next = blNow;
   if (next < target)      next = min(next + 15, target);
   else if (next > target) next = max(next - 2, target);
@@ -661,27 +666,34 @@ void loop() {
   ws.loop();
 
   static bool wasTouched = false;
+  static bool swallowTouch = false;       // true while a wake-up touch is still held down
   static uint32_t lastPress = 0;
   if (ts.touched()) {
-    wakeBacklight();                                   // any touch wakes the screen...
-    TS_Point p = ts.getPoint();
-    int sx = constrain(map(p.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCR_W), 0, SCR_W - 1);
-    int sy = constrain(map(p.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCR_H), 0, SCR_H - 1);
-    int hit = -1;
-    for (int i = 0; i < 3; i++)
-      if (sx >= btns[i].x && sx < btns[i].x + btns[i].w &&
-          sy >= btns[i].y && sy < btns[i].y + btns[i].h) hit = i;
+    if (screenOff) swallowTouch = true;   // screen was fully off: this touch only wakes it
+    wakeBacklight();                      // any touch wakes the screen
+    if (!swallowTouch) {
+      TS_Point p = ts.getPoint();
+      int sx = constrain(map(p.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCR_W), 0, SCR_W - 1);
+      int sy = constrain(map(p.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCR_H), 0, SCR_H - 1);
+      int hit = -1;
+      for (int i = 0; i < 3; i++)
+        if (sx >= btns[i].x && sx < btns[i].x + btns[i].w &&
+            sy >= btns[i].y && sy < btns[i].y + btns[i].h) hit = i;
 
-    if (!wasTouched && hit >= 0 && millis() - lastPress > 250) {  // touch still interacts
-      lastPress = millis();
-      sendCmd(btns[hit].cmd);
+      if (!wasTouched && hit >= 0 && millis() - lastPress > 250) {  // dim mode: touch still acts
+        lastPress = millis();
+        sendCmd(btns[hit].cmd);
+      }
+      if (hit != pressedBtn) { pressedBtn = hit; drawButtons(); }
+      wasTouched = true;
     }
-    if (hit != pressedBtn) { pressedBtn = hit; drawButtons(); }
-    wasTouched = true;
-  } else if (wasTouched) {
-    wasTouched = false;
-    pressedBtn = -1;
-    drawButtons();
+  } else {
+    swallowTouch = false;
+    if (wasTouched) {
+      wasTouched = false;
+      pressedBtn = -1;
+      drawButtons();
+    }
   }
 
   // Test hook: type 'w' in the Serial Monitor to simulate a Wi-Fi drop
