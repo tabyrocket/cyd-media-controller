@@ -1,0 +1,42 @@
+## Professional .NET Baseline Gitignore
+
+# Build results and outputs
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+bld/
+[Bb]in/
+[Oo]bj/
+[Log]s/
+
+# NuGet Packages
+*.nupkg
+*.snupkg
+packages/
+
+# User-specific files and IDE configurations
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+.idea/
+.vscode/*
+!.vscode/settings.json
+.fleet/
+.cr/
+
+# CoreCLR and crash dumps
+*.dump
+
+# Local environment secrets (Always exclude sensitive data)
+.env
+appsettings.Development.json
+appsettings.Local.json
+
+# OS files
+.DS_Store
+Thumbs.db
