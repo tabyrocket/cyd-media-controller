@@ -12,6 +12,7 @@ builder.Services.ConfigureHttpJsonOptions(o =>
     o.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower);
 builder.Services.AddSingleton<MediaState>();
 builder.Services.AddSingleton<Hub>();
+builder.Services.AddSingleton<Controller>();
 builder.Services.AddHostedService<MediaPoller>();
 
 var app = builder.Build();
@@ -32,7 +33,7 @@ app.MapGet("/artwork", (HttpContext ctx, MediaState st) =>
     return a == null ? Results.NotFound() : Results.File(a, "image/jpeg");
 });
 
-app.Map("/media", async (HttpContext ctx, MediaState st, Hub hub) =>
+app.Map("/media", async (HttpContext ctx, MediaState st, Hub hub, Controller ctrl) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = 400; return; }
 
@@ -42,16 +43,21 @@ app.Map("/media", async (HttpContext ctx, MediaState st, Hub hub) =>
     string baseUrl = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
     Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] WS client connected: {ctx.Connection.RemoteIpAddress} ({hub.Count} total)");
 
-    // Watches for the client closing or vanishing, and wakes the send loop when it does
+    // Reads commands from the client, and watches for it closing or vanishing
     var recv = Task.Run(async () =>
     {
-        var buf = new byte[256];
+        var buf = new byte[512];
         try
         {
             while (ws.State == WebSocketState.Open)
             {
                 var r = await ws.ReceiveAsync(buf, ct);
                 if (r.MessageType == WebSocketMessageType.Close) break;
+                if (r.MessageType == WebSocketMessageType.Text && r.EndOfMessage)
+                {
+                    string text = System.Text.Encoding.UTF8.GetString(buf, 0, r.Count);
+                    _ = ctrl.HandleAsync(text);
+                }
             }
         }
         catch { }
@@ -298,6 +304,46 @@ class MediaPoller(MediaState state, Hub hub) : BackgroundService
         {
             Console.WriteLine($"   artwork encode failed: {ex.GetType().Name}: {ex.Message}");
             return null;
+        }
+    }
+}
+
+// Runs button commands from the ESP32 against the current media session
+class Controller
+{
+    GlobalSystemMediaTransportControlsSessionManager? manager;
+
+    public async Task HandleAsync(string text)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(text);
+            string cmd = doc.RootElement.GetProperty("cmd").GetString() ?? "";
+
+            manager ??= await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
+            var s = manager.GetCurrentSession();
+            if (s == null)
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] cmd '{cmd}' ignored: no active session");
+                return;
+            }
+
+            bool ok;
+            switch (cmd)
+            {
+                case "next":   ok = await s.TrySkipNextAsync(); break;
+                case "prev":   ok = await s.TrySkipPreviousAsync(); break;
+                case "toggle": ok = await s.TryTogglePlayPauseAsync(); break;
+                default:
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] unknown cmd '{cmd}'");
+                    return;
+            }
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] cmd '{cmd}' -> {(ok ? "ok" : "rejected by app")}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] cmd error: {ex.GetType().Name}: {ex.Message}");
+            manager = null;
         }
     }
 }
