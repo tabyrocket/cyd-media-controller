@@ -18,7 +18,7 @@ builder.Services.AddHostedService<MediaPoller>();
 var app = builder.Build();
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(15) });
 
-app.MapGet("/", () => "MediaBridge is running. Try /now-playing, /artwork, and ws://<ip>:8080/media");
+app.MapGet("/", () => "MediaBridge is running. Try /now-playing, /artwork, /text-test?s=..., and ws://<ip>:8080/media");
 
 app.MapGet("/now-playing", (HttpContext ctx, MediaState st) =>
 {
@@ -31,6 +31,23 @@ app.MapGet("/artwork", (HttpContext ctx, MediaState st) =>
     var a = st.Art;
     ctx.Response.Headers.CacheControl = "no-store";
     return a == null ? Results.NotFound() : Results.File(a, "image/jpeg");
+});
+
+// Alpha-mask bitmap for one text line: /text?line=title|artist|album&v=N
+app.MapGet("/text", (HttpContext ctx, MediaState st, string? line) =>
+{
+    ctx.Response.Headers.CacheControl = "no-store";
+    var t = st.Text;
+    byte[]? b = line switch { "title" => t.Title, "artist" => t.Artist, "album" => t.Album, _ => null };
+    return b == null ? Results.NotFound() : Results.File(b, "application/octet-stream");
+});
+
+// Debug: see exactly what the ESP32 would receive for any string, as a PNG.
+// e.g. http://<ip>:8080/text-test?s=夜に駆ける&line=title   (line=artist for the small size)
+app.MapGet("/text-test", (string s, string? line) =>
+{
+    var m = TextRender.Render(s, line != "artist" && line != "album", force: true);
+    return m == null ? Results.NotFound() : Results.File(TextRender.MaskToPng(m), "image/png");
 });
 
 app.Map("/media", async (HttpContext ctx, MediaState st, Hub hub, Controller ctrl) =>
@@ -105,15 +122,21 @@ static class Json
         var s = st.Current;
         int v = st.ArtVersion;
         string? artUrl = v > 0 ? $"{baseUrl}/artwork?v={v}" : null;
+
+        var tx = st.Text;
+        string? TextUrl(byte[]? b, string line) => b == null ? null : $"{baseUrl}/text?line={line}&v={tx.Version}";
+
         return new NowPlaying(s.Title, s.Artist, s.Album, s.State,
             s.PositionMs, s.DurationMs, artUrl, s.UpdatedAt, s.App,
-            v > 0 ? st.ArtColors : null);
+            v > 0 ? st.ArtColors : null,
+            TextUrl(tx.Title, "title"), TextUrl(tx.Artist, "artist"), TextUrl(tx.Album, "album"));
     }
 }
 
 record NowPlaying(string Title, string Artist, string Album, string State,
                   long PositionMs, long DurationMs, string? ArtUrl, long UpdatedAt, string App,
-                  int[]? ArtColors);
+                  int[]? ArtColors,
+                  string? TitleImg, string? ArtistImg, string? AlbumImg);
 
 record Snapshot(string App, string Title, string Artist, string Album, string State,
                 long PositionMs, long DurationMs, long UpdatedAt)
@@ -122,12 +145,20 @@ record Snapshot(string App, string Title, string Artist, string Album, string St
         new("", "", "", "", "stopped", 0, 0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 }
 
+// Alpha masks for lines that contain non-ASCII text (null = the ESP32 draws it with its own font)
+record TextSet(int Version, byte[]? Title, byte[]? Artist, byte[]? Album)
+{
+    public static TextSet Empty => new(0, null, null, null);
+}
+
 class MediaState
 {
     public volatile Snapshot Current = Snapshot.Empty;
+    public volatile TextSet Text = TextSet.Empty;
     byte[]? art;
     int[]? artColors;
     int artCounter;
+    int textCounter;
 
     public byte[]? Art => art;
     public int[]? ArtColors => artColors;
@@ -136,6 +167,8 @@ class MediaState
 
     public void SetArt(byte[] bytes, int[] colors) { artCounter++; artColors = colors; art = bytes; }
     public void ClearArt() { art = null; artColors = null; }
+    public void SetText(byte[]? title, byte[]? artist, byte[]? album) =>
+        Text = new TextSet(++textCounter, title, artist, album);
 }
 
 // Tracks connected WebSocket clients and wakes them when something changed
@@ -184,6 +217,7 @@ class MediaPoller(MediaState state, Hub hub) : BackgroundService
                 {
                     state.Current = Snapshot.Empty;
                     state.ClearArt();
+                    if (lastTrackKey != "") state.SetText(null, null, null);
                     lastTrackKey = "";
                     if (lastLogKey != "NONE") { Console.WriteLine("No active media session"); lastLogKey = "NONE"; }
                     if (lastNotifyKey != "NONE") { lastNotifyKey = "NONE"; hub.Notify(); }
@@ -217,6 +251,11 @@ class MediaPoller(MediaState state, Hub hub) : BackgroundService
                         lastTrackKey = trackKey;
                         artTries = 0;
                         state.ClearArt();
+                        // Lines with non-ASCII text become alpha masks; plain ASCII lines stay null
+                        state.SetText(
+                            TextRender.Render(props.Title, title: true),
+                            TextRender.Render(props.Artist, title: false),
+                            TextRender.Render(props.AlbumTitle, title: false));
                     }
 
                     if (!state.HasArt && props.Thumbnail != null && artTries < 5)
@@ -251,7 +290,9 @@ class MediaPoller(MediaState state, Hub hub) : BackgroundService
                     if (logKey != lastLogKey)
                     {
                         lastLogKey = logKey;
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {stateStr}: {props.Artist} - {props.Title} ({app})");
+                        var tx = state.Text;
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {stateStr}: {props.Artist} - {props.Title} ({app})" +
+                            $"  [text masks: title={(tx.Title?.Length ?? 0)}B artist={(tx.Artist?.Length ?? 0)}B album={(tx.Album?.Length ?? 0)}B]");
                     }
                 }
             }

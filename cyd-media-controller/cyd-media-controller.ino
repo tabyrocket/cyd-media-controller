@@ -24,7 +24,7 @@
 
 // ---------- tunables ----------
 #define BL_PIN          21
-#define BL_FULL         204
+#define BL_FULL         230
 #define BL_DIM          25        // 0-255, lower = darker
 #define DIM_AFTER_MS    30000     // not playing for this long -> dim
 #define SLEEP_AFTER_MS  300000   // total inactivity before the screen turns fully off (5 min)
@@ -58,6 +58,19 @@
 #define TIME_H   18
 #define MAX_JPG  40000
 
+// ---------- bridge-rendered text lines (anything that isn't plain ASCII) ----------
+// These must match TextRender.cs in the bridge (TitleMaxW, TitleH, SubMaxW, SubH).
+// Memory used: title ~22 KB + artist ~3 KB + album ~3 KB.
+// If the [heap] log shows too little free memory, lower IMG_TITLE_MAXW here AND TitleMaxW in the bridge.
+#define IMG_TITLE_MAXW 800
+#define IMG_TITLE_H    28
+#define IMG_SUB_MAXW   TEXT_W
+#define IMG_SUB_H      18
+#define IMG_HDR        4                    // 2 bytes width + 2 bytes height, little endian
+#define TXT_TITLE      0
+#define TXT_ARTIST     1
+#define TXT_ALBUM      2
+
 #define RGB565(r,g,b) ((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3))
 #define C_BG     TFT_BLACK
 #define C_BTN_ON RGB565(30,215,96)
@@ -80,7 +93,8 @@ WebSocketsClient ws;
 // ---------- state ----------
 bool wsUp = false;
 bool wifiUp = true;
-String title, artist, album, stateStr;
+String title, artist, album, stateStr;          // ASCII-only versions (used by the built-in fonts)
+String rawTitle, rawArtist, rawAlbum;           // original UTF-8, used for change detection
 bool isPlaying = false;
 long posMs = 0, durMs = 0;
 uint32_t posAt = 0;
@@ -105,6 +119,22 @@ String   wantUrl, wantKey, doneKey;
 int      artRetries = 0;
 uint32_t nextArtTry = 0;
 uint32_t trackChangedAt = 0;
+
+// ---------- bitmap text lines ----------
+struct TextImg {
+  uint8_t *buf = nullptr;     // IMG_HDR bytes of header, then w*h alpha bytes
+  size_t   cap = 0;
+  int      maxW = 0;
+  String   wantUrl, wantKey, doneKey;
+  int      retries = 0;
+  uint32_t nextTry = 0;
+  bool     valid = false;     // buf holds the image for wantKey
+  uint16_t w = 0, h = 0;
+  bool wanted()  const { return wantUrl.length() > 0; }
+  bool pending() const { return wanted() && !valid && retries < 3; }   // still being fetched
+};
+TextImg tImg[3];
+bool titleImgActive = false;   // the title is currently drawn from its bitmap
 
 // ---------- background gradient ----------
 const uint8_t DEF_TOP[3] = {22, 26, 34};     // neutral dark blue, used when there is no art
@@ -265,6 +295,38 @@ void drawLine(int x, int y, const String &str, int font, uint16_t col) {
   txtSpr.pushSprite(x, y);
 }
 
+// Blends a bridge-rendered white-on-transparent mask into txtSpr (which already holds the gradient).
+// srcOff = first source column to show. period > 0 wraps the source (for the scrolling title).
+void blitMask(const TextImg &t, int srcOff, int period, int y) {
+  const uint8_t *m = t.buf + IMG_HDR;
+  for (int x = 0; x < TEXT_W; x++) {
+    int sx = srcOff + x;
+    if (period > 0) sx %= period;
+    if (sx >= t.w) continue;
+    const uint8_t *p = m + sx;
+    for (int r = 0; r < t.h; r++, p += t.w) {
+      uint8_t a = *p;
+      if (!a) continue;
+      if (a >= 250) { txtSpr.drawPixel(x, r, TFT_WHITE); continue; }
+      uint16_t bg = rowCol[constrain(y + r, 0, SCR_H - 1)];
+      txtSpr.drawPixel(x, r, txtSpr.alphaBlend(a, TFT_WHITE, bg));
+    }
+  }
+}
+
+void drawImgLine(int x, int y, const TextImg &t, int srcOff, int period) {
+  sprBg(txtSpr, TEXT_W, SPR_H, y);
+  blitMask(t, srcOff, period, y);
+  txtSpr.pushSprite(x, y);
+}
+
+// Artist / album line: bitmap if we have one, blank while it is being fetched, else the ASCII fallback
+void drawSubLine(int y, const TextImg &t, const String &fallback) {
+  if (t.valid)          drawImgLine(TEXT_X, y, t, 0, 0);
+  else if (t.pending()) drawLine(TEXT_X, y, "", 2, TFT_WHITE);
+  else                  drawLine(TEXT_X, y, fitText(fallback, TEXT_W, 2), 2, TFT_WHITE);
+}
+
 void drawTimeLabel(int x, const String &str, bool right) {
   sprBg(timeSpr, TIME_W, TIME_H, TIME_Y);
   timeSpr.setTextColor(C_GREY);
@@ -318,6 +380,11 @@ void drawButtons() {
 }
 
 void drawScrollTitle() {
+  if (titleImgActive) {
+    // period = 0 means "don't wrap" (the title fits, so it is drawn static)
+    drawImgLine(TEXT_X, TITLE_YS, tImg[TXT_TITLE], scrollOff, titleScroll ? tImg[TXT_TITLE].w + SCROLL_GAP : 0);
+    return;
+  }
   sprBg(txtSpr, TEXT_W, SPR_H, TITLE_YS);
   txtSpr.setTextColor(TFT_WHITE);
   txtSpr.drawString(title, -scrollOff, 0, 4);
@@ -338,24 +405,46 @@ void updateScroll() {
 
 void drawText(Mode m) {
   if (m == M_PLAY) {
-    String l1, l2;
-    titleScroll = splitTitle(title, TEXT_W, l1, l2);
-    if (titleScroll) {
-      drawLine(TEXT_X, TITLE_Y1, "", 4, TFT_WHITE);       // clear both title lines first
+    TextImg &ti = tImg[TXT_TITLE];
+    if (ti.valid) {
+      // Title from the bridge's bitmap: one line, scrolls if wider than the text area
+      titleImgActive = true;
+      drawLine(TEXT_X, TITLE_Y1, "", 4, TFT_WHITE);
       drawLine(TEXT_X, TITLE_Y2, "", 4, TFT_WHITE);
-      titleW = tft.textWidth(title, 4);
+      titleScroll = ti.w > TEXT_W;
+      titleW = ti.w;
       scrollOff = 0;
       scrollNext = 0;
       scrollHold = millis() + SCROLL_HOLD_MS;
       drawScrollTitle();
+    } else if (ti.pending()) {
+      // bitmap is on its way: show nothing rather than a row of '?'
+      titleImgActive = false;
+      titleScroll = false;
+      drawLine(TEXT_X, TITLE_Y1, "", 4, TFT_WHITE);
+      drawLine(TEXT_X, TITLE_Y2, "", 4, TFT_WHITE);
     } else {
-      drawLine(TEXT_X, TITLE_Y1, l1, 4, TFT_WHITE);
-      drawLine(TEXT_X, TITLE_Y2, l2, 4, TFT_WHITE);
+      titleImgActive = false;
+      String l1, l2;
+      titleScroll = splitTitle(title, TEXT_W, l1, l2);
+      if (titleScroll) {
+        drawLine(TEXT_X, TITLE_Y1, "", 4, TFT_WHITE);       // clear both title lines first
+        drawLine(TEXT_X, TITLE_Y2, "", 4, TFT_WHITE);
+        titleW = tft.textWidth(title, 4);
+        scrollOff = 0;
+        scrollNext = 0;
+        scrollHold = millis() + SCROLL_HOLD_MS;
+        drawScrollTitle();
+      } else {
+        drawLine(TEXT_X, TITLE_Y1, l1, 4, TFT_WHITE);
+        drawLine(TEXT_X, TITLE_Y2, l2, 4, TFT_WHITE);
+      }
     }
-    drawLine(TEXT_X, ARTIST_Y, fitText(artist, TEXT_W, 2), 2, TFT_WHITE);
-    drawLine(TEXT_X, ALBUM_Y,  fitText(album,  TEXT_W, 2), 2, TFT_WHITE);
+    drawSubLine(ARTIST_Y, tImg[TXT_ARTIST], artist);
+    drawSubLine(ALBUM_Y,  tImg[TXT_ALBUM],  album);
   } else {
     titleScroll = false;
+    titleImgActive = false;
     const char *a = "Nothing", *b = "playing";
     if (m == M_OFFLINE) { a = "Bridge"; b = "offline"; }
     if (m == M_NOWIFI)  { a = "Wi-Fi";  b = "lost"; }
@@ -389,16 +478,18 @@ void drawProgress() {
   if (durMs != durShown) { durShown = durMs; drawTimeLabel(BAR_X + BAR_W - TIME_W, fmtTime(durMs), true); }
 }
 
-// ================= artwork fetch =================
-bool fetchArt(const String &url) {
+// ================= HTTP fetch =================
+// Downloads a URL into buf (at most cap bytes). Needs a Content-Length from the server.
+bool fetchInto(const String &url, uint8_t *buf, size_t cap, size_t &outLen) {
+  outLen = 0;
   HTTPClient http;
   http.setConnectTimeout(3000);
   http.setTimeout(5000);
   if (!http.begin(url)) return false;
   int code = http.GET();
-  if (code != 200) { Serial.printf("[art] HTTP %d\n", code); http.end(); return false; }
+  if (code != 200) { Serial.printf("[http] %d for %s\n", code, url.c_str()); http.end(); return false; }
   int cl = http.getSize();
-  if (cl <= 0 || cl > MAX_JPG) { Serial.printf("[art] bad length %d\n", cl); http.end(); return false; }
+  if (cl <= 0 || (size_t)cl > cap) { Serial.printf("[http] bad length %d (max %u)\n", cl, (unsigned)cap); http.end(); return false; }
 
   WiFiClient *s = http.getStreamPtr();
   size_t got = 0;
@@ -406,7 +497,7 @@ bool fetchArt(const String &url) {
   while (got < (size_t)cl && millis() - last < 5000) {
     int av = s->available();
     if (av > 0) {
-      got += s->readBytes(jpgBuf + got, min((size_t)av, (size_t)cl - got));
+      got += s->readBytes(buf + got, min((size_t)av, (size_t)cl - got));
       last = millis();
     } else if (!http.connected()) {
       break;
@@ -415,10 +506,30 @@ bool fetchArt(const String &url) {
     }
   }
   http.end();
-  artLen = got;
+  outLen = got;
   return got == (size_t)cl;
 }
 
+bool fetchArt(const String &url) {
+  return fetchInto(url, jpgBuf, MAX_JPG, artLen);
+}
+
+bool fetchTextImg(TextImg &t) {
+  size_t len = 0;
+  if (!fetchInto(t.wantUrl, t.buf, t.cap, len) || len < IMG_HDR) return false;
+  uint16_t w = t.buf[0] | (t.buf[1] << 8);
+  uint16_t h = t.buf[2] | (t.buf[3] << 8);
+  if (w == 0 || h == 0 || w > t.maxW || h > SPR_H || len != (size_t)IMG_HDR + (size_t)w * h) {
+    Serial.printf("[txt] unusable image %ux%u, %u bytes. Do the bridge and firmware size constants match?\n",
+                  w, h, (unsigned)len);
+    return false;
+  }
+  t.w = w;
+  t.h = h;
+  return true;
+}
+
+// ================= artwork + text updates =================
 void updateArt() {
   if (drawnMode != M_PLAY) return;
 
@@ -448,9 +559,39 @@ void updateArt() {
   }
 }
 
+// Fetches at most one missing text bitmap per call, so the loop stays responsive.
+void updateText() {
+  if (drawnMode != M_PLAY) return;
+  for (int i = 0; i < 3; i++) {
+    TextImg &t = tImg[i];
+    if (!t.wanted()) {
+      if (t.valid) { t.valid = false; t.doneKey = ""; textDirty = true; }
+      continue;
+    }
+    if (t.wantKey == t.doneKey) continue;
+    if (t.retries >= 3 || millis() < t.nextTry) continue;
+
+    t.valid = false;
+    uint32_t t0 = millis();
+    if (fetchTextImg(t)) {
+      t.doneKey = t.wantKey;
+      t.valid = true;
+      textDirty = true;
+      Serial.printf("[txt] line %d ok %ux%u in %lu ms, heap=%u\n", i, t.w, t.h,
+                    (unsigned long)(millis() - t0), (unsigned)ESP.getFreeHeap());
+    } else {
+      t.retries++;
+      t.nextTry = millis() + 1000;
+      Serial.printf("[txt] line %d fetch failed (try %d of 3)\n", i, t.retries);
+      if (t.retries >= 3) textDirty = true;            // give up and draw the ASCII fallback
+    }
+    return;
+  }
+}
+
 // ================= render =================
 void render() {
-  Mode m = !wifiUp ? M_NOWIFI : (!wsUp ? M_OFFLINE : (title.length() == 0 ? M_IDLE : M_PLAY));
+  Mode m = !wifiUp ? M_NOWIFI : (!wsUp ? M_OFFLINE : (rawTitle.length() == 0 ? M_IDLE : M_PLAY));
   if (m != drawnMode || forceRepaint) {
     if (m != drawnMode && m != M_PLAY) {
       artValid = false; doneKey = "";
@@ -467,7 +608,7 @@ void render() {
   }
   if (textDirty) { textDirty = false; drawText(m); }
   if (iconDirty) { iconDirty = false; drawButton(1, pressedBtn == 1); }
-  if (m == M_PLAY) { drawProgress(); updateArt(); }
+  if (m == M_PLAY) { drawProgress(); updateText(); updateArt(); }
 }
 
 // ================= backlight =================
@@ -497,9 +638,13 @@ void handleMessage(uint8_t *payload, size_t length) {
   JsonDocument doc;
   if (deserializeJson(doc, payload, length)) return;
 
-  String nt = asciiOnly(doc["title"]  | "");
-  String na = asciiOnly(doc["artist"] | "");
-  String nb = asciiOnly(doc["album"]  | "");
+  // Raw UTF-8 is what we compare; the ASCII-only copy is just for the built-in fonts
+  String rt = doc["title"]  | "";
+  String ra = doc["artist"] | "";
+  String rb = doc["album"]  | "";
+  String nt = asciiOnly(rt.c_str());
+  String na = asciiOnly(ra.c_str());
+  String nb = asciiOnly(rb.c_str());
   String ns = doc["state"] | "";
   long   np = doc["position_ms"] | 0L;
   long   nd = doc["duration_ms"] | 0L;
@@ -513,13 +658,29 @@ void handleMessage(uint8_t *payload, size_t length) {
     pendHave = true;
   }
 
-  String nkey = nurl.length() ? nurl + "|" + nt + "|" + na : String("");
+  String nkey = nurl.length() ? nurl + "|" + rt + "|" + ra : String("");
   if (nkey != wantKey) { wantKey = nkey; wantUrl = nurl; artRetries = 0; nextArtTry = 0; }
 
-  bool sameTrack = (nt == title && na == artist);
+  // Bitmap text lines: the bridge sends a URL for each line that has non-ASCII characters
+  static const char *imgField[3] = { "title_img", "artist_img", "album_img" };
+  const String *rawLine[3] = { &rt, &ra, &rb };
+  for (int i = 0; i < 3; i++) {
+    String u = doc[imgField[i]].is<const char *>() ? String(doc[imgField[i]].as<const char *>()) : String("");
+    String k = u.length() ? u + "|" + *rawLine[i] : String("");
+    TextImg &t = tImg[i];
+    if (k != t.wantKey) {
+      t.wantKey = k; t.wantUrl = u;
+      t.retries = 0; t.nextTry = 0;
+      t.valid = false; t.doneKey = "";
+      textDirty = true;
+    }
+  }
+
+  bool sameTrack = (rt == rawTitle && ra == rawArtist);
   bool nowPlaying = (ns == "playing");
 
-  if (!sameTrack || nb != album) {
+  if (!sameTrack || rb != rawAlbum) {
+    rawTitle = rt; rawArtist = ra; rawAlbum = rb;
     title = nt; artist = na; album = nb;
     textDirty = true;
     lastFill = -1; lastSec = -1; durShown = -1;
@@ -557,7 +718,7 @@ void sendCmd(const char *cmd) {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== CYD display polish ===");
+  Serial.println("\n=== CYD display polish (unicode text) ===");
 
   tft.init();
   tft.setRotation(1);
@@ -575,6 +736,19 @@ void setup() {
   }
   jpgBuf = (uint8_t *)malloc(MAX_JPG);
   if (!jpgBuf) { Serial.println("malloc failed!"); while (true) delay(1000); }
+
+  tImg[TXT_TITLE].maxW  = IMG_TITLE_MAXW;
+  tImg[TXT_TITLE].cap   = IMG_HDR + (size_t)IMG_TITLE_MAXW * IMG_TITLE_H;
+  tImg[TXT_ARTIST].maxW = IMG_SUB_MAXW;
+  tImg[TXT_ARTIST].cap  = IMG_HDR + (size_t)IMG_SUB_MAXW * IMG_SUB_H;
+  tImg[TXT_ALBUM].maxW  = IMG_SUB_MAXW;
+  tImg[TXT_ALBUM].cap   = IMG_HDR + (size_t)IMG_SUB_MAXW * IMG_SUB_H;
+  for (int i = 0; i < 3; i++) {
+    tImg[i].buf = (uint8_t *)malloc(tImg[i].cap);
+    if (!tImg[i].buf) { Serial.printf("text buffer %d malloc failed!\n", i); while (true) delay(1000); }
+  }
+  Serial.printf("[mem] buffers allocated. heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   buildBg();
 
   TJpgDec.setJpgScale(1);
