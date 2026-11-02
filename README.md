@@ -26,6 +26,7 @@ Album art, live progress, album-colour backgrounds, Japanese/Korean/accented tex
 - **Album-colour gradient background**: the colours are taken from each cover, then darkened hard so text always stays readable, even with a bright cover.
 - **Japanese, Korean, accented and other non-ASCII text**: the bridge renders these lines with Windows fonts and the ESP32 draws them over the gradient. No font has to be stored on the board. See [Unicode text](#unicode-text).
 - **Touch remote**: previous, play/pause and next control the same app that's shown on screen.
+- **Touch seek**: touch or drag on the progress bar to jump to that point in the track. The touch area is much larger than the thin bar, so you don't need to be precise.
 - **Scrolling titles**: titles that fit in two lines wrap; longer ones scroll smoothly.
 - **Smart backlight**: dims after 30 s of not playing, and **turns fully off after 5 minutes of inactivity**. While it is only dimmed, **one touch wakes it and presses the button underneath**, with no wake-up tap. From fully off, the first touch only wakes the screen.
 - **Self-healing**: separate "Wi-Fi lost" and "Bridge offline" screens, automatic reconnects, and a low-heap watchdog.
@@ -74,7 +75,7 @@ flowchart LR
     C -- "WebSocket /media<br/>JSON metadata" --> D["ESP32 CYD"]
     C -- "HTTP /artwork<br/>128×128 JPEG" --> D
     C -- "HTTP /text<br/>alpha masks (non-ASCII lines only)" --> D
-    D -- "cmd: prev / toggle / next" --> C
+    D -- "cmd: prev / toggle / next / seek" --> C
 ```
 
 1. **MediaBridge** (Windows) reads the active media session through `GlobalSystemMediaTransportControlsSessionManager`, and polls it every 500 ms.
@@ -185,6 +186,7 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 | Action | Result |
 |---|---|
 | Tap ⏮ / ⏯ / ⏭ | Previous / play-pause / next in the app shown on screen |
+| Touch or drag on the progress bar | Previews the position while you drag; the seek is sent when you lift your finger |
 | Touch while dimmed | Wakes the screen **and** presses that button |
 | Pause or stop for 30 s | Backlight fades to ~10% |
 | No activity for 5 minutes | Backlight fades fully off. Touch while fully off **only wakes the screen**; the touch that wakes it does not press a button |
@@ -215,6 +217,8 @@ While something is playing the screen stays at full brightness and never dims or
 | `WIFI_RESTART_MS` | 300000 | Restart if Wi-Fi is down this long |
 | `HEAP_RESTART_BELOW` | 60000 | Restart if free heap stays under this (bytes) |
 | `IMG_TITLE_MAXW` | 800 | Widest title bitmap in pixels (about 22 KB of RAM). Must match `TitleMaxW` in the bridge |
+| `SEEK_PAD_X` / `SEEK_PAD_UP` / `SEEK_PAD_DOWN` | 10 / 14 / 14 | How far (px) the seek touch area extends around the 4 px progress bar |
+| `SEEK_RELEASE_MS` | 60 | Finger must be off the screen this long before a seek is sent (filters touch flicker) |
 
 Background darkness is set by the `darkenColour(...)` calls in `handleMessage` (top: brightness scale 0.55, clamped to 0.10–0.30; bottom: 0.30, clamped to 0.03–0.16).
 
@@ -247,7 +251,7 @@ The ESP32's built-in fonts only cover ASCII, and a full CJK font doesn't fit com
 |---|---|---|
 | `TitleEm` / `SubEm` | 24 / 15 | Font size in pixels for the title and for artist/album |
 | `TitleBaseline` / `SubBaseline` | 21 / 14 | Pixel row where letters sit inside the mask |
-| `SubGamma` | 0.70 | Boosts the faint edges of the small artist/album lines. Lower is bolder, 1.0 is off |
+| `SubGamma` | 0.40 | Boosts the faint edges of the small artist/album lines. Lower is bolder, 1.0 is off |
 
 Open `http://<pc-ip>:8080/text-test?s=<text>&line=title` (or `line=artist`) to see exactly what the ESP32 will receive, as a PNG, without playing anything.
 
@@ -269,7 +273,7 @@ Open `http://<pc-ip>:8080/text-test?s=<text>&line=title` (or `line=artist`) to s
 | `GET /text?line=title\|artist\|album` | Alpha mask for a non-ASCII line (404 if that line is plain ASCII). Format: 2-byte width, 2-byte height (little endian), then width × height alpha bytes |
 | `GET /text-test?s=<text>&line=title\|artist` | Debug: renders any text and returns the mask as a PNG |
 | `WS /media` | Pushes the JSON on connect, on every change, and every 5 s |
-| `WS /media` (client → bridge) | `{"cmd":"prev"}`, `{"cmd":"toggle"}`, `{"cmd":"next"}` |
+| `WS /media` (client → bridge) | `{"cmd":"prev"}`, `{"cmd":"toggle"}`, `{"cmd":"next"}`, `{"cmd":"seek","pos_ms":84200}` |
 
 ```json
 {
@@ -336,6 +340,7 @@ To check the Unicode text path, use `/text-test` in a browser first. Then play t
 | Nothing detected from a media app | That app doesn't use Windows media controls (some browsers need media-key integration on) |
 | Wrong app on screen | Windows chooses the current session. Pause or close the others |
 | A button does nothing | The app rejected the command; the bridge console shows "rejected by app" |
+| Seeking does nothing | The app doesn't allow seeking through Windows media controls. The bridge console shows "seek ignored" or "rejected by app" |
 | Whine from the screen when dimmed | In `ledcSetup(0, 5000, 8)`, raise 5000 to 20000 |
 | Compile error `JsonDocument` not found | You have ArduinoJson 6; install 7.x |
 | Compile error on `WebSocketsClient.h` | Wrong library; it must be the one by Markus Sattler |
@@ -346,7 +351,7 @@ To check the Unicode text path, use `/text-test` in a browser first. Then play t
 
 - **Windows only** for the bridge, and one PC per display.
 - **Non-ASCII text is drawn from bitmaps rendered by the bridge**, so it needs the bridge to be reachable and looks slightly different from the built-in font. See [Unicode text](#unicode-text) for the details.
-- **There is no authentication.** The bridge listens on your whole local network on port 8080. Anyone on that network can read what you're playing and send previous, play/pause and next. Use it only on a network you trust, and never forward the port to the internet.
+- **There is no authentication.** The bridge listens on your whole local network on port 8080. Anyone on that network can read what you're playing and send previous, play/pause, next and seek. Use it only on a network you trust, and never forward the port to the internet.
 - The 2.4 GHz band only, as on all ESP32s.
 
 ## Credits

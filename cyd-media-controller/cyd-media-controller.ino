@@ -56,6 +56,14 @@
 #define TIME_Y   168
 #define TIME_W   50
 #define TIME_H   18
+
+// ---------- seeking (touch the progress bar) ----------
+// Zone = bar rectangle grown by these margins (px). Art ends at y=138 and buttons start at y=200.
+#define SEEK_PAD_X       10     // left/right of the bar
+#define SEEK_PAD_UP      14     // above the bar
+#define SEEK_PAD_DOWN    14     // below the bar
+#define SEEK_RELEASE_MS  60     // finger must be gone this long before the seek is sent (filters flicker)
+#define SEEK_HOLD_MS     1500   // after a seek, ignore the bridge's (still old) position for this long
 #define MAX_JPG  40000
 
 // ---------- bridge-rendered text lines (anything that isn't plain ASCII) ----------
@@ -110,6 +118,11 @@ bool progVisible = false;
 int  lastFill = -1;
 long lastSec = -1;
 long durShown = -1;
+
+// seeking
+bool     seekActive = false;    // a finger is currently dragging on the progress bar
+long     seekPreviewMs = 0;     // where the finger currently points to
+uint32_t seekHoldUntil = 0;
 
 // ---------- artwork state ----------
 uint8_t *jpgBuf = nullptr;
@@ -271,6 +284,12 @@ long curPos() {
   if (p < 0) p = 0;
   if (durMs > 0 && p > durMs) p = durMs;
   return p;
+}
+
+// Screen x -> position in the track (clamped to the bar, so touching the margins gives 0 / end)
+long seekPosFromX(int sx) {
+  int rel = constrain(sx - BAR_X, 0, BAR_W);
+  return (long)((int64_t)rel * durMs / BAR_W);
 }
 
 bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
@@ -456,7 +475,7 @@ void drawText(Mode m) {
 
 void drawProgress() {
   static uint32_t lastCheck = 0;
-  if (millis() - lastCheck < 200) return;
+  if (!seekActive && millis() - lastCheck < 200) return;   // while dragging, redraw immediately
   lastCheck = millis();
 
   if (durMs <= 0) {
@@ -465,7 +484,7 @@ void drawProgress() {
   }
   if (!progVisible) { progVisible = true; lastFill = -1; lastSec = -1; durShown = -1; }
 
-  long p = curPos();
+  long p = seekActive ? seekPreviewMs : curPos();
   int fill = (int)((int64_t)p * BAR_W / durMs);
   long sec = p / 1000;
 
@@ -689,10 +708,14 @@ void handleMessage(uint8_t *payload, size_t length) {
   if (nowPlaying != isPlaying) { isPlaying = nowPlaying; iconDirty = true; lastActivity = millis(); }
   stateStr = ns;
 
-  long est = curPos();
-  bool ignoreBackward = sameTrack && isPlaying && np < est && (est - np) < 2000 && nd == durMs;
-  if (!ignoreBackward) { posMs = np; posAt = millis(); }
-  if (!isPlaying) { posMs = np; posAt = millis(); }
+  // Right after a seek the bridge still reports the old position for a moment: don't let it undo the jump
+  bool holdPos = sameTrack && (int32_t)(seekHoldUntil - millis()) > 0;
+  if (!holdPos) {
+    long est = curPos();
+    bool ignoreBackward = sameTrack && isPlaying && np < est && (est - np) < 2000 && nd == durMs;
+    if (!ignoreBackward) { posMs = np; posAt = millis(); }
+    if (!isPlaying) { posMs = np; posAt = millis(); }
+  }
   durMs = nd;
 }
 
@@ -712,6 +735,24 @@ void sendCmd(const char *cmd) {
   if (!wsUp) { Serial.printf("[cmd] %s NOT sent (bridge not connected)\n", cmd); return; }
   ws.sendTXT(String("{\"cmd\":\"") + cmd + "\"}");
   Serial.printf("[cmd] sent %s\n", cmd);
+}
+
+void sendSeek(long ms) {
+  if (!wsUp) { Serial.println("[cmd] seek NOT sent (bridge not connected)"); return; }
+  char b[48];
+  snprintf(b, sizeof(b), "{\"cmd\":\"seek\",\"pos_ms\":%ld}", ms);
+  ws.sendTXT(b);
+  Serial.printf("[cmd] sent seek %ld ms\n", ms);
+}
+
+// Called when the finger leaves the bar: jump there, and show the new position straight away
+void finishSeek() {
+  seekActive = false;
+  if (durMs <= 0) return;
+  sendSeek(seekPreviewMs);
+  posMs = seekPreviewMs;
+  posAt = millis();
+  seekHoldUntil = millis() + SEEK_HOLD_MS;
 }
 
 // ================= setup / loop =================
@@ -842,17 +883,36 @@ void loop() {
   static bool wasTouched = false;
   static bool swallowTouch = false;       // true while a wake-up touch is still held down
   static uint32_t lastPress = 0;
+  static uint32_t lastTouchMs = 0;
+  static float seekX = 0;                 // smoothed finger x while seeking
   if (ts.touched()) {
+    lastTouchMs = millis();
     if (screenOff) swallowTouch = true;   // screen was fully off: this touch only wakes it
     wakeBacklight();                      // any touch wakes the screen
     if (!swallowTouch) {
       TS_Point p = ts.getPoint();
       int sx = constrain(map(p.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCR_W), 0, SCR_W - 1);
       int sy = constrain(map(p.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCR_H), 0, SCR_H - 1);
+
+      // A touch that STARTS in the zone around the progress bar grabs it. After that only x matters,
+      // so the finger can drift up/down without losing the bar.
+      if (!wasTouched && drawnMode == M_PLAY && progVisible && durMs > 0 &&
+          sx >= BAR_X - SEEK_PAD_X && sx < BAR_X + BAR_W + SEEK_PAD_X &&
+          sy >= BAR_Y - SEEK_PAD_UP && sy < BAR_Y + BAR_H + SEEK_PAD_DOWN) {
+        seekActive = true;
+        seekX = sx;
+      } else if (seekActive) {
+        seekX += (sx - seekX) * 0.4f;     // light smoothing
+      }
+
       int hit = -1;
-      for (int i = 0; i < 3; i++)
-        if (sx >= btns[i].x && sx < btns[i].x + btns[i].w &&
-            sy >= btns[i].y && sy < btns[i].y + btns[i].h) hit = i;
+      if (seekActive) {
+        seekPreviewMs = seekPosFromX((int)(seekX + 0.5f));
+      } else {
+        for (int i = 0; i < 3; i++)
+          if (sx >= btns[i].x && sx < btns[i].x + btns[i].w &&
+              sy >= btns[i].y && sy < btns[i].y + btns[i].h) hit = i;
+      }
 
       if (!wasTouched && hit >= 0 && millis() - lastPress > 250) {  // dim mode: touch still acts
         lastPress = millis();
@@ -862,11 +922,16 @@ void loop() {
       wasTouched = true;
     }
   } else {
-    swallowTouch = false;
-    if (wasTouched) {
-      wasTouched = false;
-      pressedBtn = -1;
-      drawButtons();
+    // While seeking, wait a moment before treating "no touch" as a release (the panel flickers)
+    bool seekPending = seekActive && (millis() - lastTouchMs < SEEK_RELEASE_MS);
+    if (!seekPending) {
+      swallowTouch = false;
+      if (wasTouched) {
+        wasTouched = false;
+        if (seekActive) finishSeek();
+        pressedBtn = -1;
+        drawButtons();
+      }
     }
   }
 

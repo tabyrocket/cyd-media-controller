@@ -276,8 +276,9 @@ class MediaPoller(MediaState state, Hub hub) : BackgroundService
 
                     // Push changes to clients
                     string notifyKey = $"{trackKey}|{stateStr}|{state.ArtVersion}|{(long)duration.TotalMilliseconds}";
-                    bool seek = stateStr == "playing" &&
-                                Math.Abs(posMs - (lastNotifyPos + (now - lastNotifyTime))) > 1500;
+                    // Detect jumps in position (also while paused, so seeking a paused track shows up quickly)
+                    long expectedPos = stateStr == "playing" ? lastNotifyPos + (now - lastNotifyTime) : lastNotifyPos;
+                    bool seek = Math.Abs(posMs - expectedPos) > (stateStr == "playing" ? 1500 : 300);
                     if (notifyKey != lastNotifyKey || seek)
                     {
                         lastNotifyKey = notifyKey;
@@ -406,6 +407,26 @@ class Controller
                 case "next":   ok = await s.TrySkipNextAsync(); break;
                 case "prev":   ok = await s.TrySkipPreviousAsync(); break;
                 case "toggle": ok = await s.TryTogglePlayPauseAsync(); break;
+                case "seek":
+                {
+                    if (!doc.RootElement.TryGetProperty("pos_ms", out var pe) || !pe.TryGetInt64(out long ms))
+                    {
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] seek ignored: missing pos_ms");
+                        return;
+                    }
+                    if (!s.GetPlaybackInfo().Controls.IsPlaybackPositionEnabled)
+                    {
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] seek ignored: this app doesn't allow seeking");
+                        return;
+                    }
+                    var tl = s.GetTimelineProperties();
+                    long dur = (long)(tl.EndTime - tl.StartTime).TotalMilliseconds;
+                    // Don't land exactly on the end, that just skips to the next track
+                    if (dur > 1000) ms = Math.Clamp(ms, 0, dur - 1000); else ms = Math.Max(ms, 0);
+                    ok = await s.TryChangePlaybackPositionAsync((tl.StartTime + TimeSpan.FromMilliseconds(ms)).Ticks);
+                    cmd = $"seek {TimeSpan.FromMilliseconds(ms):m\\:ss}";
+                    break;
+                }
                 default:
                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] unknown cmd '{cmd}'");
                     return;
